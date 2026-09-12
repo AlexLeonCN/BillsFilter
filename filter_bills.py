@@ -33,7 +33,7 @@ CURRENCY = "CNY"
 IMPORT_HEADER = ["分类", "子类别", "货币", "金额", "账户", "记录人", "日期", "时间", "备注"]
 PLACEHOLDER_RE = re.compile(r"^[\-\—_]+$")
 # Move these note keywords from CcbcImport into CcbcTrans (transfers / repayments).
-BOC_TRANS_NOTE_KEYWORDS = ("银联入账", "跨行转账", "还款")
+BOC_TRANS_NOTE_KEYWORDS = ("银联入账", "跨行转账", "还款", "无卡交易")
 
 # Display name used in import file for normalized semantic accounts.
 SEMANTIC_DISPLAY = {
