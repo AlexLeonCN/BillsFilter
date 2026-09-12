@@ -26,11 +26,14 @@ WECHAT_PATH = WECHAT_DIR / "微信支付账单流水文件(20250913-20260912)_20
 ALIPAY_OUT = ALIPAY_DIR / "AlipayImport.csv"
 WECHAT_OUT = WECHAT_DIR / "WechatImport.csv"
 BOC_OUT = BOC_DIR / "CcbcImport.csv"
+BOC_TRANS_OUT = BOC_DIR / "CcbcTrans.csv"
 
 RECORDER = "AlexLeon"
 CURRENCY = "CNY"
 IMPORT_HEADER = ["分类", "子类别", "货币", "金额", "账户", "记录人", "日期", "时间", "备注"]
 PLACEHOLDER_RE = re.compile(r"^[\-\—_]+$")
+# Move these note keywords from CcbcImport into CcbcTrans (transfers / repayments).
+BOC_TRANS_NOTE_KEYWORDS = ("银联入账", "跨行转账", "还款")
 
 # Display name used in import file for normalized semantic accounts.
 SEMANTIC_DISPLAY = {
@@ -763,6 +766,23 @@ def filter_boc(baseline: Counter) -> tuple[list[dict], dict]:
     return output, stats
 
 
+def is_boc_transfer_note(note: str | None) -> bool:
+    text = note or ""
+    return any(keyword in text for keyword in BOC_TRANS_NOTE_KEYWORDS)
+
+
+def split_boc_transfers(records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split BOC rows: transfers/repayments -> CcbcTrans, remainder -> CcbcImport."""
+    imports: list[dict] = []
+    transfers: list[dict] = []
+    for rec in records:
+        if is_boc_transfer_note(rec.get("备注")):
+            transfers.append(rec)
+        else:
+            imports.append(rec)
+    return imports, transfers
+
+
 def main() -> None:
     print("Loading baseline from", BASELINE_PATH)
     baseline = load_baseline_keys()
@@ -773,11 +793,18 @@ def main() -> None:
     boc_baseline = baseline.copy()
     boc_records, boc_stats = filter_boc(boc_baseline)
     print(dict(boc_stats))
-    write_import_csv(BOC_OUT, boc_records)
-    print(f"Wrote {BOC_OUT}: {len(boc_records)} rows")
 
-    print("\nBOC sample:")
-    for r in boc_records[:8]:
+    boc_import, boc_trans = split_boc_transfers(boc_records)
+    write_import_csv(BOC_OUT, boc_import)
+    write_import_csv(BOC_TRANS_OUT, boc_trans)
+    print(f"Wrote {BOC_OUT}: {len(boc_import)} rows")
+    print(f"Wrote {BOC_TRANS_OUT}: {len(boc_trans)} rows")
+
+    print("\nBOC import sample:")
+    for r in boc_import[:5]:
+        print(r)
+    print("\nBOC transfer sample:")
+    for r in boc_trans[:5]:
         print(r)
 
 
