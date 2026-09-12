@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
-"""Filter Alipay / WeChat bills against Budget.xlsx baseline and export import files."""
+"""Filter Alipay / WeChat / BOC bills against Budget.xlsx baseline and export import files."""
 
 from __future__ import annotations
 
 import csv
 import re
 from collections import Counter
-from copy import copy
 from datetime import datetime, date, time, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from openpyxl import Workbook, load_workbook
+import pymupdf
+from openpyxl import load_workbook
 from openpyxl.styles import Font
 
 ROOT = Path(__file__).resolve().parent
-BASELINE_PATH = ROOT / "Budget.xlsx"
+PERIOD_DIR = ROOT / "2026-08"
+BASELINE_PATH = PERIOD_DIR / "Budget.xlsx"
 TEMPLATE_PATH = ROOT / "BudgetImportTemplate.xlsx"
-ALIPAY_PATH = ROOT / "支付宝交易明细(20250913-20260912).csv"
-WECHAT_PATH = ROOT / "微信支付账单流水文件(20250913-20260912)_20260912015624.xlsx"
-ALIPAY_OUT = ROOT / "AlipayImport.xlsx"
-WECHAT_OUT = ROOT / "WechatImport.xlsx"
+ALIPAY_DIR = PERIOD_DIR / "支付宝账单"
+WECHAT_DIR = PERIOD_DIR / "微信账单"
+BOC_DIR = PERIOD_DIR / "中国银行账单"
+ALIPAY_PATH = ALIPAY_DIR / "支付宝交易明细(20250913-20260912).csv"
+WECHAT_PATH = WECHAT_DIR / "微信支付账单流水文件(20250913-20260912)_20260912015624.xlsx"
+ALIPAY_OUT = ALIPAY_DIR / "AlipayImport.csv"
+WECHAT_OUT = WECHAT_DIR / "WechatImport.csv"
+BOC_OUT = BOC_DIR / "CcbcImport.csv"
 
 RECORDER = "AlexLeon"
 CURRENCY = "CNY"
+IMPORT_HEADER = ["分类", "子类别", "货币", "金额", "账户", "记录人", "日期", "时间", "备注"]
+PLACEHOLDER_RE = re.compile(r"^[\-\—_]+$")
 
 # Display name used in import file for normalized semantic accounts.
 SEMANTIC_DISPLAY = {
@@ -168,6 +175,15 @@ def strip_payment_method(raw: str | None) -> str:
         return ""
     # Alipay often appends discounts after &
     return text.split("&")[0].strip()
+
+
+def clean_field(value: str | None) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("\n", "").replace("\r", "").strip()
+    if not text or PLACEHOLDER_RE.match(text):
+        return ""
+    return text
 
 
 def extract_card_last4(text: str) -> str | None:
@@ -551,7 +567,7 @@ def write_import_xlsx(path: Path, records: list[dict]) -> None:
         ws = template.active
         ws.title = "Records"
 
-    header = ["分类", "子类别", "货币", "金额", "账户", "记录人", "日期", "时间", "备注"]
+    header = IMPORT_HEADER
     # Ensure header
     for col, name in enumerate(header, 1):
         cell = ws.cell(1, col, name)
@@ -572,34 +588,196 @@ def write_import_xlsx(path: Path, records: list[dict]) -> None:
     template.save(path)
 
 
+def write_import_csv(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=IMPORT_HEADER, extrasaction="ignore")
+        writer.writeheader()
+        for rec in records:
+            row = {k: rec.get(k) for k in IMPORT_HEADER}
+            # Keep empty cells empty rather than "None"
+            for k, v in list(row.items()):
+                if v is None:
+                    row[k] = ""
+            writer.writerow(row)
+
+
+def map_boc_category(
+    tx_name: str,
+    memo: str,
+    peer: str,
+    signed_amount: Decimal,
+    self_name: str | None,
+) -> tuple[str | None, str | None]:
+    text = f"{tx_name} {memo} {peer}"
+    abs_amt = abs(signed_amount)
+    is_income = signed_amount > 0
+
+    if "结息" in tx_name:
+        return ("投资", "结息")
+    if "退款" in tx_name or "冲正" in tx_name:
+        return ("退款", None)
+    if "信用卡还款" in text:
+        return ("支出平账", None)
+    if "房贷" in text:
+        return ("房贷", None)
+    if any(k in text for k in ("房租", "月房租", "月租", "车位")):
+        if "车位" in text or "沪" in text:
+            return ("交通", "车位费")
+        return ("居家", "住宿房租")
+    if any(k in text for k in ("滴滴", "打车", "出行快车")):
+        return ("交通", "打车")
+    if any(k in text for k in ("地铁", "公交", "停车", "加油", "高铁", "火车")):
+        return ("交通", None)
+    if any(k in text for k in ("医院", "药房", "医药", "医疗", "健康")):
+        return ("医疗", None)
+    if any(k in text for k in ("餐饮", "外卖", "美食", "咖啡", "奶茶", "饭")):
+        return ("餐饮", None)
+    if tx_name in {"自助取款", "自助存款"}:
+        return ("支出平账" if signed_amount < 0 else "收入平账", None)
+
+    # Own-account transfers (counterparty is self)
+    if self_name and self_name in peer:
+        return ("收入平账" if is_income else "支出平账", None)
+
+    if "跨行转账" in tx_name or "银联入账" in tx_name:
+        if is_income:
+            return ("人情", None) if abs_amt < 20000 else ("收入平账", None)
+        if abs_amt >= 1000:
+            return ("人情", None)
+        return ("人情", None)
+
+    if "提现" in tx_name:
+        return ("收入平账", None)
+
+    # Default third-party quick pay / card-not-present
+    if is_income:
+        return ("退款", None)
+    return ("购物", None)
+
+
+def read_boc_pdf(path: Path) -> tuple[str | None, str | None, list[dict]]:
+    """Parse one BOC transaction PDF. Returns (card_no, customer_name, rows)."""
+    doc = pymupdf.open(path)
+    header_text = doc[0].get_text() if doc.page_count else ""
+    card_m = re.search(r"借记卡号：(\d+)", header_text)
+    name_m = re.search(r"客户姓名：([^\n\r]+)", header_text)
+    card_no = card_m.group(1) if card_m else None
+    customer = name_m.group(1).strip() if name_m else None
+
+    rows: list[dict] = []
+    for page_index in range(doc.page_count):
+        page = doc[page_index]
+        tables = page.find_tables()
+        if not tables.tables:
+            continue
+        data = tables.tables[0].extract()
+        for raw in data:
+            if not raw or not str(raw[0] or "").startswith("20"):
+                continue
+            rows.append(
+                {
+                    "记账日期": raw[0],
+                    "记账时间": raw[1],
+                    "币别": raw[2],
+                    "金额": raw[3],
+                    "余额": raw[4],
+                    "交易名称": clean_field(raw[5]),
+                    "渠道": clean_field(raw[6]),
+                    "网点名称": clean_field(raw[7]),
+                    "附言": clean_field(raw[8]),
+                    "对方账户名": clean_field(raw[9]),
+                    "对方卡号/账号": clean_field(raw[10]),
+                    "对方开户行": clean_field(raw[11]),
+                    "_source_file": path.name,
+                    "_card_no": card_no,
+                    "_customer": customer,
+                }
+            )
+    doc.close()
+    return card_no, customer, rows
+
+
+def read_boc_rows() -> list[dict]:
+    if not BOC_DIR.is_dir():
+        raise FileNotFoundError(f"BOC bill directory not found: {BOC_DIR}")
+    all_rows: list[dict] = []
+    for pdf in sorted(BOC_DIR.glob("*.pdf")):
+        _card, _name, rows = read_boc_pdf(pdf)
+        all_rows.extend(rows)
+    return all_rows
+
+
+def boc_account_raw(card_no: str | None) -> str:
+    if not card_no:
+        return "中国银行"
+    return f"中国银行({card_no[-4:]})"
+
+
+def filter_boc(baseline: Counter) -> tuple[list[dict], dict]:
+    stats = Counter()
+    output: list[dict] = []
+    for raw in read_boc_rows():
+        stats["total"] += 1
+        d, t = parse_datetime(f"{raw.get('记账日期')} {raw.get('记账时间')}")
+        signed = parse_amount(raw.get("金额"))
+        if d is None or signed is None or signed == 0:
+            stats["skipped_parse"] += 1
+            continue
+        amount = abs(signed)
+        pay_raw = boc_account_raw(raw.get("_card_no"))
+        key = account_key(pay_raw)
+        if key is None:
+            stats["no_account"] += 1
+        if consume_duplicate(baseline, d, key, amount):
+            stats["filtered_dup"] += 1
+            continue
+
+        tx_name = raw.get("交易名称") or ""
+        memo = raw.get("附言") or ""
+        peer = raw.get("对方账户名") or ""
+        cat, sub = map_boc_category(tx_name, memo, peer, signed, raw.get("_customer"))
+        inout = "收入" if signed > 0 else "支出"
+        note = build_note(
+            peer,
+            memo,
+            tx_name,
+            raw.get("对方开户行"),
+            f"[{inout}]",
+            f"渠道:{raw.get('渠道')}" if raw.get("渠道") else None,
+        )
+        output.append(
+            {
+                "分类": cat,
+                "子类别": sub,
+                "货币": CURRENCY,
+                "金额": float(amount),
+                "账户": display_account(pay_raw, key),
+                "记录人": RECORDER,
+                "日期": format_date(d),
+                "时间": format_time(t),
+                "备注": note,
+            }
+        )
+        stats["kept"] += 1
+    return output, stats
+
+
 def main() -> None:
-    print("Loading baseline from", BASELINE_PATH.name)
+    print("Loading baseline from", BASELINE_PATH)
     baseline = load_baseline_keys()
     print(f"Baseline unique keys: {len(baseline)}, total entries: {sum(baseline.values())}")
     print("Card display map:", CARD_DISPLAY)
 
-    # Independent baseline copies so Alipay/WeChat filtering don't affect each other
-    alipay_baseline = baseline.copy()
-    wechat_baseline = baseline.copy()
+    print("\nFiltering BOC (China Bank)...")
+    boc_baseline = baseline.copy()
+    boc_records, boc_stats = filter_boc(boc_baseline)
+    print(dict(boc_stats))
+    write_import_csv(BOC_OUT, boc_records)
+    print(f"Wrote {BOC_OUT}: {len(boc_records)} rows")
 
-    print("\nFiltering Alipay...")
-    alipay_records, alipay_stats = filter_alipay(alipay_baseline)
-    print(dict(alipay_stats))
-    write_import_xlsx(ALIPAY_OUT, alipay_records)
-    print(f"Wrote {ALIPAY_OUT.name}: {len(alipay_records)} rows")
-
-    print("\nFiltering WeChat...")
-    wechat_records, wechat_stats = filter_wechat(wechat_baseline)
-    print(dict(wechat_stats))
-    write_import_xlsx(WECHAT_OUT, wechat_records)
-    print(f"Wrote {WECHAT_OUT.name}: {len(wechat_records)} rows")
-
-    # Quick samples
-    print("\nAlipay sample:")
-    for r in alipay_records[:5]:
-        print(r)
-    print("\nWeChat sample:")
-    for r in wechat_records[:5]:
+    print("\nBOC sample:")
+    for r in boc_records[:8]:
         print(r)
 
 
