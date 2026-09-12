@@ -1,18 +1,23 @@
 # BillsFilter
 
-用于将支付宝 / 微信账单对照 `Budget.xlsx` 基线去重，并导出可导入的 Budget 模板文件。
+用于将支付宝 / 微信 / 中国银行账单对照 `Budget.xlsx` 基线去重，并导出可导入的 Budget 模板文件。
 
 ## 输入（只读）
 
-- `Budget.xlsx`：基线账单
+- `2026-08/Budget.xlsx`：基线账单
 - `BudgetImportTemplate.xlsx`：导入模板（去掉样例数据后写入结果）
-- `支付宝交易明细(20250913-20260912).csv`：支付宝账单
-- `微信支付账单流水文件(20250913-20260912)_20260912015624.xlsx`：微信账单
+- `2026-08/支付宝账单/`：支付宝账单
+- `2026-08/微信账单/`：微信账单
+- `2026-08/中国银行账单/`：中国银行交易流水 PDF（可多份，自动遍历）
 
 ## 输出
 
-- `AlipayImport.xlsx`：过滤后的支付宝账单
-- `WechatImport.xlsx`：过滤后的微信账单
+- `2026-08/支付宝账单/AlipayImport.csv`：过滤后的支付宝账单
+- `2026-08/微信账单/WechatImport.csv`：过滤后的微信账单
+- `2026-08/中国银行账单/CcbcImport.csv`：过滤后的中国银行账单
+
+输出列参考 `BudgetImportTemplate.xlsx` 的 Records 表头：  
+`分类,子类别,货币,金额,账户,记录人,日期,时间,备注`
 
 ## 去重规则
 
@@ -26,5 +31,6 @@
 ## 使用
 
 ```bash
+pip install -r requirements.txt
 python3 filter_bills.py
 ```
