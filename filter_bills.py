@@ -33,7 +33,9 @@ CURRENCY = "CNY"
 IMPORT_HEADER = ["分类", "子类别", "货币", "金额", "账户", "记录人", "日期", "时间", "备注"]
 PLACEHOLDER_RE = re.compile(r"^[\-\—_]+$")
 # Move these note keywords from CcbcImport into CcbcTrans (transfers / repayments).
-BOC_TRANS_NOTE_KEYWORDS = ("银联入账", "跨行转账", "还款", "无卡交易")
+BOC_TRANS_NOTE_KEYWORDS = ("银联入账", "跨行转账", "还款", "无卡交易", "提现")
+# Keep these notes in CcbcImport even if they also match transfer keywords.
+BOC_IMPORT_NOTE_EXCEPTIONS = ("晶辉物业",)
 
 # Display name used in import file for normalized semantic accounts.
 SEMANTIC_DISPLAY = {
@@ -768,6 +770,8 @@ def filter_boc(baseline: Counter) -> tuple[list[dict], dict]:
 
 def is_boc_transfer_note(note: str | None) -> bool:
     text = note or ""
+    if any(keyword in text for keyword in BOC_IMPORT_NOTE_EXCEPTIONS):
+        return False
     return any(keyword in text for keyword in BOC_TRANS_NOTE_KEYWORDS)
 
 
